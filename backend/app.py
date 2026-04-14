@@ -8,8 +8,8 @@ from utils.pdf_reader import extract_text_from_pdf
 app = Flask(__name__)
 CORS(app)
 
-# 1. Load the Medical Model (BioBART)
-model_name = "GanjinZero/biobart-base"
+# 1. Load a Lighter, Faster Model (Fits in 512MB RAM)
+model_name = "sshleifer/distilbart-cnn-12-6" 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
 
