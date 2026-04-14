@@ -1,27 +1,35 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
 import os
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from utils.pdf_reader import extract_text_from_pdf
+import fitz  # PyMuPDF
+import pytesseract
+from pdf2image import convert_from_path
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
 
-# 1. Load a Lighter, Faster Model (Fits in 512MB RAM)
-model_name = "sshleifer/distilbart-cnn-12-6" 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+# --- Configuration ---
+# Get your token from https://huggingface.co/settings/tokens
+# For now, it will work without one, but it's slower.
+HF_TOKEN = os.getenv("HF_TOKEN", "") 
+API_URL = "https://api-inference.huggingface.co/models/sshleifer/distilbart-cnn-12-6"
 
-def summarize_chunk(text):
-    """Helper function to summarize individual pieces of text"""
-    inputs = tokenizer(text, max_length=1024, return_tensors="pt", truncation=True)
-    summary_ids = model.generate(inputs["input_ids"], max_length=150, min_length=40, length_penalty=2.0)
-    return tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-
-@app.route('/')
-def home():
-    return "Medical Summarizer Backend is Active"
+def query_hf_api(text):
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+    payload = {
+        "inputs": text,
+        "parameters": {"max_length": 150, "min_length": 50, "do_sample": False}
+    }
+    
+    response = requests.post(API_URL, headers=headers, json=payload)
+    
+    # Hugging Face sometimes returns a list or a dict depending on the state
+    result = response.json()
+    if isinstance(result, list):
+        return result[0]['summary_text']
+    return "Error: Could not retrieve summary. Hugging Face might be loading the model."
 
 @app.route('/summarize', methods=['POST'])
 def summarize():
@@ -29,40 +37,38 @@ def summarize():
         return jsonify({"error": "No file uploaded"}), 400
     
     file = request.files['file']
-    
-    # Create the utils folder if it doesn't exist to avoid saving errors
-    if not os.path.exists("utils"):
-        os.makedirs("utils")
-        
-    temp_path = os.path.join("utils", file.filename)
-    file.save(temp_path)
-    
+    file_path = "temp.pdf"
+    file.save(file_path)
+
+    text = ""
     try:
-        # 2. Extract text using your utility function
-        # We call it 'full_text' here to avoid 'text is not defined' errors
-        full_text = extract_text_from_pdf(temp_path)
-        
-        # Clean up the file immediately after reading
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Try direct text extraction first
+        doc = fitz.open(file_path)
+        for page in doc:
+            text += page.get_text()
+        doc.close()
 
-        # 3. Validation Check
-        if not full_text or len(full_text) < 50:
-            return jsonify({"error": "PDF text too short or unreadable. Is it a scanned image?"}), 400
+        # If no text found, use OCR
+        if not text.strip():
+            images = convert_from_path(file_path)
+            for img in images:
+                text += pytesseract.image_to_string(img)
+                
+        if not text.strip():
+            return jsonify({"error": "No text could be extracted from the PDF"}), 400
 
-        # 4. CHUNKING: Split long text (3000 chars per chunk)
-        chunks = [full_text[i:i+3000] for i in range(0, len(full_text), 3000)]
+        # Use the API instead of the local model
+        summary = query_hf_api(text[:3000]) # Truncate text to avoid API limits
         
-        # Summarize each chunk and join them together
-        summaries = [summarize_chunk(c) for c in chunks]
-        final_result = " ".join(summaries)
-        
-        return jsonify({"summary": final_result})
+        return jsonify({"summary": summary})
 
     except Exception as e:
-        print(f"Error during summarization: {str(e)}")
-        return jsonify({"error": "An internal error occurred during analysis"}), 500
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-if __name__ == "__main__":
-    # use_reloader=False is critical for Windows to prevent the model loading twice
-    app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)
+if __name__ == '__main__':
+    # Render uses the PORT environment variable
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
